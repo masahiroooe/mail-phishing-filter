@@ -1,0 +1,3 @@
+# オプション: インストールすると公式 google-genai SDK 経由で呼び出します。
+# 未インストールでも Python 標準ライブラリ経由で Gemini Interactions API (v1) が動作します。
+google-genai>=3.5.0

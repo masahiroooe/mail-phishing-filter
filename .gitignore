@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+
+# Secrets / local config / runtime data
+.env
+.env.*
+api_key
+config.json
+scan_state.json
+*.sqlite3
+*.sqlite3-*
+*.jsonl
+*.log
+*.eml
+
+# Compiled AppleScript & macOS artifacts
+*.scpt
+.DS_Store
