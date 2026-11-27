@@ -3,7 +3,11 @@
 
 from __future__ import annotations
 
+import importlib
 import json
+import os
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -457,6 +461,212 @@ class TestPhishingAnalyzer(unittest.TestCase):
             # 短い正規返信だけ Gemini に渡り、OKになる
             self.assertEqual(api_calls["count"], 1)
             self.assertEqual(results[2]["action"], "OK")
+
+    def test_cache_hit_and_dry_run_reapplication(self) -> None:
+        calls = {"count": 0}
+
+        def fake_gemini(*args, **kwargs):
+            calls["count"] += 1
+            return {
+                "verdict": "phishing",
+                "confidence": 0.96,
+                "impersonated_brand": "三井住友カード",
+                "signals": ["送信元ドメイン不一致"],
+                "reason": "なりすましメール",
+            }
+
+        with tempfile.TemporaryDirectory() as td:
+            db_path = Path(td) / "cache.sqlite3"
+            cfg = dict(pa.DEFAULT_CONFIG)
+
+            # 1回目: dry_run=True で API 呼び出し＋キャッシュ保存
+            r1 = pa.analyze_email_bytes(
+                SAMPLE_PHISHING_EML,
+                cfg,
+                api_key="dummy-key",
+                use_cache=True,
+                dry_run=True,
+                write_log=False,
+                cache_db_path=db_path,
+                caller_fn=fake_gemini,
+            )
+            self.assertEqual(calls["count"], 1)
+            self.assertEqual(r1["action"], "OK")
+            self.assertEqual(r1["recommended_action"], "JUNK")
+            self.assertFalse(r1["cached"])
+
+            # 2回目: dry_run=False でキャッシュヒット（API呼び出し増えず action=JUNK）
+            r2 = pa.analyze_email_bytes(
+                SAMPLE_PHISHING_EML,
+                cfg,
+                api_key="dummy-key",
+                use_cache=True,
+                dry_run=False,
+                write_log=False,
+                cache_db_path=db_path,
+                caller_fn=fake_gemini,
+            )
+            self.assertEqual(calls["count"], 1)
+            self.assertEqual(r2["action"], "JUNK")
+            self.assertTrue(r2["cached"])
+
+    def test_batch_partial_missing_response_failsafe(self) -> None:
+        def partial_batch_gemini(*args, **kwargs):
+            # 3通送ったうち index=1 が欠落した異常応答
+            return {
+                "results": [
+                    {
+                        "index": 0,
+                        "verdict": "phishing",
+                        "confidence": 0.95,
+                        "impersonated_brand": "三井住友カード",
+                        "signals": ["ドメイン不一致"],
+                        "reason": "偽装",
+                    },
+                    {
+                        "index": 2,
+                        "verdict": "legitimate",
+                        "confidence": 0.98,
+                        "impersonated_brand": "",
+                        "signals": ["正規"],
+                        "reason": "問題なし",
+                    },
+                ]
+            }
+
+        eml_mid = SAMPLE_LEGIT_EML.replace(b"legit-test-001", b"legit-test-002")
+        with tempfile.TemporaryDirectory() as td:
+            res = pa.analyze_emails_batch(
+                [SAMPLE_PHISHING_EML, eml_mid, SAMPLE_LEGIT_EML],
+                dict(pa.DEFAULT_CONFIG),
+                api_key="dummy-key",
+                use_cache=False,
+                write_log=False,
+                cache_db_path=Path(td) / "cache.sqlite3",
+                caller_fn=partial_batch_gemini,
+            )
+            self.assertEqual(res[0]["action"], "JUNK")
+            self.assertEqual(res[1]["action"], "ERROR")
+            self.assertEqual(res[1]["recommended_action"], "OK")
+            self.assertEqual(res[2]["action"], "OK")
+
+    def test_whitelisted_sender_exempt_from_flood_rule(self) -> None:
+        def make_legit(i: int) -> bytes:
+            return (
+                "From: GitHub <noreply@github.com>\n"
+                "To: user@example.com\n"
+                f"Subject: Notification #{i}\n"
+                f"Date: Fri, 27 Nov 2026 10:{10 + i:02d}:00 +0900\n"
+                f"Message-ID: <gh-wl-{i}@github.com>\n"
+                "Authentication-Results: mx.example.com; spf=pass; dkim=pass; dmarc=pass\n"
+                "MIME-Version: 1.0\n"
+                "Content-Type: text/plain; charset=UTF-8\n\n"
+                "This is a standard notification body for your repository activity and build status.\n"
+            ).encode("utf-8")
+
+        with tempfile.TemporaryDirectory() as td:
+            cfg = dict(pa.DEFAULT_CONFIG)
+            cfg["whitelist_domains"] = ["github.com"]
+            cfg["flood_threshold"] = 3
+            res = pa.analyze_emails_batch(
+                [make_legit(i) for i in range(5)],
+                cfg,
+                api_key="",
+                use_cache=False,
+                write_log=False,
+                cache_db_path=Path(td) / "cache.sqlite3",
+            )
+            self.assertTrue(all(r["action"] == "OK" for r in res))
+            self.assertTrue(all(r["model"] == "rule:whitelist" for r in res))
+
+    def test_all_submodules_importable_and_cli_runs_from_other_cwd(self) -> None:
+        submodules = [
+            "mail_phishing_filter",
+            "mail_phishing_filter.config",
+            "mail_phishing_filter.storage",
+            "mail_phishing_filter.email_parser",
+            "mail_phishing_filter.local_rules",
+            "mail_phishing_filter.gemini_client",
+            "mail_phishing_filter.analyzer",
+            "mail_phishing_filter.mail_applescript",
+        ]
+        for mod in submodules:
+            self.assertIsNotNone(importlib.import_module(mod))
+
+        # Mail.app ルール実行時と同じく別ディレクトリ(/tmp)からCLIを --batch 起動できること
+        project_dir = Path(__file__).resolve().parent
+        with tempfile.TemporaryDirectory() as td:
+            f1 = Path(td) / "empty.eml"
+            f2 = Path(td) / "gibberish.eml"
+            f1.write_text("From: a@b.example\nSubject:  \n\n  \n", encoding="utf-8")
+            f2.write_text(
+                "From: a@b.example\nSubject: x\n\n" + ("A" * 80) + "\n",
+                encoding="utf-8",
+            )
+            env = dict(os.environ)
+            env["MAIL_PHISHING_FILTER_CONFIG_DIR"] = str(Path(td) / "cfg")
+            proc = subprocess.run(
+                [
+                    sys.executable,
+                    str(project_dir / "phishing_analyzer.py"),
+                    "--batch",
+                    "--no-cache",
+                    str(f1),
+                    str(f2),
+                ],
+                cwd="/tmp",
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=15,
+                check=False,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            lines = [ln for ln in proc.stdout.splitlines() if ln.strip()]
+            self.assertEqual(len(lines), 2)
+            self.assertTrue(lines[0].startswith("JUNK|1.00|"))
+            self.assertTrue(lines[1].startswith("JUNK|1.00|"))
+
+    def test_dump_line_injection_and_path_traversal_blocked(self) -> None:
+        from mail_phishing_filter.mail_applescript import parse_dump_lines
+
+        with tempfile.TemporaryDirectory() as td:
+            malicious_raw = "\n".join(
+                [
+                    # 正常行
+                    "MailAcc\t12345\t2026-11-27 10:00:00\tmsg_1_12345.eml",
+                    # パストラバーサル攻撃
+                    "MailAcc\t12346\t2026-11-27 10:00:01\t../../etc/passwd",
+                    # 絶対パス注入攻撃
+                    "MailAcc\t12347\t2026-11-27 10:00:02\t/etc/passwd",
+                    # 列数改ざん（余計なタブを含む偽行）
+                    "MailAcc\t12348\t2026-11-27 10:00:03\tmsg_2_12348.eml\textra",
+                    # 不正な日時形式
+                    "MailAcc\t12349\tinvalid-date\tmsg_3_12349.eml",
+                    # 数値以外のメッセージID
+                    "MailAcc\tabc\t2026-11-27 10:00:04\tmsg_4_999.eml",
+                ]
+            )
+            parsed = parse_dump_lines(malicious_raw, td)
+            self.assertEqual(len(parsed), 1)
+            self.assertEqual(parsed[0]["id"], "12345")
+            self.assertTrue(Path(parsed[0]["eml_path"]).resolve().parent == Path(td).resolve())
+
+    def test_huge_html_dos_protection(self) -> None:
+        # 2MB 相当の巨大 HTML でも上限キャップにより高速かつ安全に解析できること
+        huge_html = "<html><body>" + ("<p>フィッシング確認テスト</p>" * 80000) + "</body></html>"
+        raw = (
+            "From: attacker@spam.example\n"
+            "To: user@example.com\n"
+            "Subject: Huge HTML\n"
+            "Date: Fri, 27 Nov 2026 10:00:00 +0900\n"
+            "Message-ID: <huge-1@spam.example>\n"
+            "MIME-Version: 1.0\n"
+            "Content-Type: text/html; charset=UTF-8\n\n"
+            + huge_html
+        ).encode("utf-8")
+        parsed = pa.parse_raw_email(raw, dict(pa.DEFAULT_CONFIG))
+        self.assertLessEqual(len(parsed["body_text"]), pa.DEFAULT_CONFIG["max_body_chars"] + 40)
 
 
 if __name__ == "__main__":

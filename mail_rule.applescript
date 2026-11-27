@@ -34,7 +34,10 @@ on processMessages(msgList)
 	set targetMsgs to {}
 	set tmpPaths to {}
 
-	-- 1) 対象メールの生ソースを一時ファイルへ書き出し（同時に来た複数通をまとめて1リクエストにする）
+	-- 1) 対象メールの生ソースをユーザー専用プライベート一時ディレクトリへ書き出し（同時受信の複数通を1リクエストにまとめる）
+	set tmpBase to POSIX path of (path to temporary items from user domain)
+	if tmpBase does not end with "/" then set tmpBase to tmpBase & "/"
+
 	repeat with eachMsg in msgList
 		try
 			set shouldSkip to false
@@ -51,7 +54,7 @@ on processMessages(msgList)
 			end tell
 
 			if not shouldSkip then
-				set tmpPath to "/tmp/mail_phishing_" & (do shell script "/usr/bin/uuidgen") & ".eml"
+				set tmpPath to tmpBase & "mail_phishing_" & (do shell script "/usr/bin/uuidgen") & ".eml"
 				my writeUTF8File(tmpPath, rawSource)
 				set end of targetMsgs to eachMsg
 				set end of tmpPaths to tmpPath

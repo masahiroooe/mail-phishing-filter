@@ -80,6 +80,47 @@ python3 scan_inbox.py --apply
   - `content_flood_window_seconds` / `content_flood_threshold`: 異アドレス同一内容のしきい値（デフォルト `3600` 秒 / `3` 通）
   - `dry_run`: `true` にすると判定ログのみ記録して移動しません
 
+## プロジェクト構成
+
+機能ごとに単一責任のモジュールへ分割しています（循環依存なし）。各モジュールの詳細な機能仕様・入出力・変更時の注意点は [mail_phishing_filter/README.md](./mail_phishing_filter/README.md) を参照してください。
+
+```text
+.
+├── phishing_analyzer.py           # 単体・バッチ判定 CLI エントリポイント
+├── scan_inbox.py                  # 受信トレイ差分スキャン CLI エントリポイント
+├── mail_phishing_filter/
+│   ├── config.py                  # 定数・設定ファイル・APIキー取得（Keychain等）
+│   ├── storage.py                 # SQLite キャッシュ・バースト集計・JSONL 履歴ログ
+│   ├── email_parser.py            # RFC 2822 解析・HTML/URL抽出・認証ヘッダー・正規化ハッシュ
+│   ├── local_rules.py             # ホワイトリスト判定・機械的無意味メール検知
+│   ├── gemini_client.py           # プロンプト・JSONスキーマ・Gemini API (SDK/REST)・リトライ
+│   ├── analyzer.py                # 判定パイプライン本体（ローカル→キャッシュ→Gemini）
+│   └── mail_applescript.py        # Mail.app 連携 AppleScript・差分スキャン状態管理
+├── mail_rule.applescript          # Mail.app ルール用 AppleScript テンプレート
+├── setup.sh                       # APIキー設定・インストール・ログ確認・ホワイトリスト管理
+└── test_phishing_analyzer.py      # ユニットテスト
+```
+
+## セキュリティ設計・検証済み観点
+
+外部から届く悪意あるメール（攻撃者が完全に制御可能な差出人・件名・本文・ヘッダー・HTML・添付ファイル名等）を起点とした攻撃に対し、以下の観点でコード監査および対策・防御テストを実施しています。
+
+| 攻撃観点 | 対策・検証結果 |
+| :--- | :--- |
+| **1. 任意コード実行（RCE / コマンドインジェクション）** | `eval` / `exec` / `pickle` / `os.system` / `shell=True` は一切不使用。AppleScript の `do shell script` に渡すのは UUID 生成パスのみでメール由来の文字列はコマンド引数に入らず、`quoted form of` でクォート。Python 側 `subprocess.run` も配列引数（`shell=False`）のみ使用。 |
+| **2. 行インジェクション・パストラバーサル（任意ファイル読み出し）** | Mail.app からのダンプ出力に攻撃者制御可能な件名・差出人を含めず、ファイル名も `^(msg\|sel)_\d+_\d+\.eml$` と `tmp_dir` 直下解決を厳密検証（違反行は破棄・ユニットテスト済み）。 |
+| **3. SQL インジェクション** | `storage.py` の全 SQLite クエリでパラメータバインド（`?` プレースホルダ）を使用。 |
+| **4. SSRF・意図しない外部アクセス** | メール本文中のリンク先 URL には一切自動アクセスしない。通信先は固定の Gemini API エンドポイント（`generativelanguage.googleapis.com`）のみ。 |
+| **5. プロンプトインジェクション** | Gemini API のツール呼び出し（Function Calling / Code Execution）を無効化しているため、プロンプトインジェクションからコード実行へ発展する経路なし。Structured Output JSON スキーマで出力形式を拘束し、異常応答はフェイルセーフ（受信トレイ維持）。 |
+| **6. 一時ファイル・認証情報の保護** | API キーは macOS キーチェーン（または権限分離ファイル）へ保管しコード・リポジトリに含めない。Mail.app ルールの一時 `.eml` はユーザー専用プライベート一時ディレクトリ（`path to temporary items from user domain`）へ書き出し、処理後即削除。 |
+| **7. 巨大メール／巨大 HTML による DoS** | HTML・プレーンテキストの解析対象に上限（各 200KB）を設け、巨大メールでも高速・省メモリで完了するよう制御（2MB HTML テスト済み）。 |
+| **8. プライバシー・公開情報管理** | Gemini Interactions API は `store=False` で呼び出し。ログ・キャッシュ・設定は `~/.config/mail-phishing-filter/` へ分離し、`.gitignore` で機密ファイル誤コミットを防止。 |
+
+### 本ツールの前提と残存リスク（スコープ外）
+- **Mail.app / OS 自体の脆弱性**: メール受信・表示を担う macOS 標準「メール」アプリ自体のゼロデイ脆弱性は本ツールの防御範囲外です（OS アップデートで対策してください）。
+- **ローカル権限侵害**: すでに攻撃者が利用者の macOS アカウント権限を取得している環境（設定ファイルやスクリプトの改ざんが可能な状態）は防御対象外です。
+- **判定回避（見逃し）**: 高度なプロンプトインジェクションや未知の手口により、フィッシングメールが `legitimate` と誤判定される可能性はゼロではありません。不審なリンクや添付ファイルは必ずご自身でも確認してください。
+
 ---
 
 ## AI生成に関する記載
