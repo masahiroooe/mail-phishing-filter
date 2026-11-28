@@ -9,15 +9,17 @@ AppleScript による Mail.app 操作と状態管理は `mail_phishing_filter/ma
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 import datetime
+import fcntl
 import json
 from pathlib import Path
 import sys
 import tempfile
-from typing import Any
+from typing import Any, Iterator
 
 from mail_phishing_filter.analyzer import analyze_emails_batch
-from mail_phishing_filter.config import STATE_PATH, load_config
+from mail_phishing_filter.config import CONFIG_DIR, STATE_PATH, load_config
 from mail_phishing_filter.mail_applescript import (
     APPLY_ACCOUNT_ACTIONS_SCRIPT,
     DUMP_ACCOUNT_INBOX_SCRIPT,
@@ -26,11 +28,42 @@ from mail_phishing_filter.mail_applescript import (
     apply_actions_batched,
     dump_account_inbox,
     dump_selected_messages,
+    is_mail_app_running,
     list_accounts,
     load_scan_state,
     save_scan_state,
+    send_macos_notification,
     update_account_watermark,
 )
+
+LOCK_PATH = CONFIG_DIR / "scan.lock"
+
+
+@contextmanager
+def acquire_scan_lock(lock_path: Path = LOCK_PATH) -> Iterator[bool]:
+    """多重起動を防ぐ非ブロッキング排他ロック。すでに別プロセスが実行中なら False を返す。"""
+    fh = None
+    try:
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        fh = lock_path.open("a+", encoding="utf-8")
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        if fh is not None:
+            fh.close()
+        yield False
+        return
+    except OSError:
+        if fh is not None:
+            fh.close()
+        yield True
+        return
+    try:
+        yield True
+    finally:
+        try:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+        finally:
+            fh.close()
 
 __all__ = [
     "APPLY_ACCOUNT_ACTIONS_SCRIPT",
@@ -58,6 +91,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--reset-state", action="store_true", help="保存済みの前回スキャン日時をすべてリセットして終了する")
     parser.add_argument("--timeout", type=int, default=300, help="アカウント1件あたりの AppleScript タイムアウト秒数（デフォルト: 300秒）")
     parser.add_argument("--batch-size", type=int, default=10, help="Gemini 1リクエストにまとめる最大メール通数（デフォルト: 10）")
+    parser.add_argument("--if-mail-running", action="store_true", help="Mail.app が起動している場合のみ実行する（定期実行向け）")
     parser.add_argument("--no-cache", action="store_true", help="キャッシュを無視して再判定")
     parser.add_argument("--json", action="store_true", help="結果をJSONで出力")
     return parser
@@ -117,6 +151,18 @@ def main(argv: list[str] | None = None) -> int:
             print("保存済みのスキャン状態はありませんでした。")
         return 0
 
+    if args.if_mail_running and not is_mail_app_running():
+        return 0
+
+    with acquire_scan_lock() as acquired:
+        if not acquired:
+            if not args.json and not args.if_mail_running:
+                print("別のスキャンプロセスが実行中のためスキップしました。", file=sys.stderr)
+            return 0
+        return _run_scan(args)
+
+
+def _run_scan(args: argparse.Namespace) -> int:
     dry_run = args.dry_run or (not args.apply)
     should_save_state = (not dry_run) or args.save_state
     cfg = load_config()
@@ -246,6 +292,17 @@ def main(argv: list[str] | None = None) -> int:
                 updated_accounts.append((acc_name, newest_iso))
         if updated_accounts:
             save_scan_state(state)
+
+    if (not dry_run) and cfg.get("notify_on_junk", True):
+        moved_junk = [
+            e for e in results
+            if e["recommended_action"] == "JUNK"
+            and e["applied_status"] in ("MOVED_TO_JUNK", "MARKED_JUNK_ONLY")
+        ]
+        if moved_junk:
+            sample = moved_junk[0]
+            msg = f"{len(moved_junk)}通を迷惑メールへ移動（例: {sample['subject'][:28]}）"
+            send_macos_notification("AIフィッシング自動振り分け", msg)
 
     if args.json:
         print(

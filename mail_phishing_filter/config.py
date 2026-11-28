@@ -41,6 +41,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "whitelist_domains": [],
     "whitelist_addresses": [],
     "whitelist_require_auth": True,
+    "notify_on_junk": True,
     "dry_run": False,
 }
 

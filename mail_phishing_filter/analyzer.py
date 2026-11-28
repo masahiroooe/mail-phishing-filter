@@ -203,6 +203,7 @@ def analyze_emails_batch(
     pending: list[tuple[int, dict[str, Any]]] = []
     history_buffer: list[dict[str, Any]] = []
 
+    # フェーズ1: ローカル判定＋キャッシュ照合のみ DB セッション内で実行し、API 通信前にロックを完全解放する
     with open_db_session(cache_db_path) as conn:
         if flood_enabled:
             record_sender_events(
@@ -309,100 +310,108 @@ def analyze_emails_batch(
 
             pending.append((idx, parsed))
 
-        if pending:
-            key = api_key if api_key is not None else get_api_key()
-            if not key:
-                for idx, parsed in pending:
-                    rec = _build_error_record(
-                        parsed,
-                        "Gemini APIキー未設定",
-                        "APIキーが未設定のため判定をスキップしました（setup.sh set-key で設定してください）",
-                        dry_run,
+    # フェーズ2: Gemini API 通信（DB ロックを保持しないため並列実行しても競合しない）
+    new_cache_entries: list[tuple[str, dict[str, Any]]] = []
+    if pending:
+        key = api_key if api_key is not None else get_api_key()
+        if not key:
+            for idx, parsed in pending:
+                rec = _build_error_record(
+                    parsed,
+                    "Gemini APIキー未設定",
+                    "APIキーが未設定のため判定をスキップしました（setup.sh set-key で設定してください）",
+                    dry_run,
+                )
+                results[idx] = rec
+                history_buffer.append(rec)
+        else:
+            chunks = _chunk_pending_items(pending, eff_batch_size, max_batch_chars)
+            for chunk_no, chunk in enumerate(chunks, 1):
+                if chunk_no > 1 and batch_interval > 0:
+                    sleep_fn(batch_interval)
+                if progress_fn:
+                    progress_fn(
+                        f"  Gemini バッチ判定 {chunk_no}/{len(chunks)}（{len(chunk)}通を1リクエストで解析中）..."
                     )
-                    results[idx] = rec
-                    history_buffer.append(rec)
-            else:
-                chunks = _chunk_pending_items(pending, eff_batch_size, max_batch_chars)
-                for chunk_no, chunk in enumerate(chunks, 1):
-                    if chunk_no > 1 and batch_interval > 0:
-                        sleep_fn(batch_interval)
-                    if progress_fn:
-                        progress_fn(
-                            f"  Gemini バッチ判定 {chunk_no}/{len(chunks)}（{len(chunk)}通を1リクエストで解析中）..."
-                        )
 
-                    if len(chunk) == 1:
-                        orig_idx, parsed = chunk[0]
-                        try:
-                            llm_res = call_gemini_with_retry(
-                                key,
-                                model,
-                                build_analysis_prompt(parsed),
-                                timeout_s,
-                                schema=RESPONSE_SCHEMA,
-                                max_output_tokens=512,
-                                max_retries=max_retries,
-                                caller_fn=caller_fn,
-                                sleep_fn=sleep_fn,
-                            )
-                            rec = _build_result_record(parsed, llm_res, cfg, model, dry_run)
-                            if use_cache:
-                                put_cached_result(conn, parsed["cache_key"], rec)
-                        except Exception as exc:
-                            rec = _build_error_record(
-                                parsed,
-                                "API呼び出しエラー",
-                                f"判定エラー（フェイルセーフで受信トレイ維持）: {str(exc)[:140]}",
-                                dry_run,
-                            )
-                        results[orig_idx] = rec
-                        history_buffer.append(rec)
-                        continue
-
-                    parsed_list = [p for _, p in chunk]
-                    max_out = min(4096, max(768, 240 * len(chunk)))
-                    batch_timeout = max(timeout_s, 30 + len(chunk) * 3)
+                if len(chunk) == 1:
+                    orig_idx, parsed = chunk[0]
                     try:
-                        batch_resp = call_gemini_with_retry(
+                        llm_res = call_gemini_with_retry(
                             key,
                             model,
-                            build_batch_analysis_prompt(parsed_list),
-                            batch_timeout,
-                            schema=BATCH_RESPONSE_SCHEMA,
-                            max_output_tokens=max_out,
+                            build_analysis_prompt(parsed),
+                            timeout_s,
+                            schema=RESPONSE_SCHEMA,
+                            max_output_tokens=512,
                             max_retries=max_retries,
                             caller_fn=caller_fn,
                             sleep_fn=sleep_fn,
                         )
-                        by_local_idx: dict[int, dict[str, Any]] = {}
-                        for item in batch_resp.get("results", []):
-                            if isinstance(item, dict) and "index" in item:
-                                try:
-                                    by_local_idx[int(item["index"])] = item
-                                except (TypeError, ValueError):
-                                    pass
-
-                        for local_i, (orig_idx, parsed) in enumerate(chunk):
-                            llm_item = by_local_idx.get(local_i)
-                            if llm_item is None:
-                                rec = _build_error_record(
-                                    parsed,
-                                    "バッチ応答欠落",
-                                    "バッチ判定の応答に該当メールが含まれなかったため受信トレイを維持しました",
-                                    dry_run,
-                                )
-                            else:
-                                rec = _build_result_record(parsed, llm_item, cfg, model, dry_run)
-                                if use_cache:
-                                    put_cached_result(conn, parsed["cache_key"], rec)
-                            results[orig_idx] = rec
-                            history_buffer.append(rec)
+                        rec = _build_result_record(parsed, llm_res, cfg, model, dry_run)
+                        if use_cache:
+                            new_cache_entries.append((parsed["cache_key"], rec))
                     except Exception as exc:
-                        err_msg = f"判定エラー（フェイルセーフで受信トレイ維持）: {str(exc)[:140]}"
-                        for orig_idx, parsed in chunk:
-                            rec = _build_error_record(parsed, "API呼び出しエラー", err_msg, dry_run)
-                            results[orig_idx] = rec
-                            history_buffer.append(rec)
+                        rec = _build_error_record(
+                            parsed,
+                            "API呼び出しエラー",
+                            f"判定エラー（フェイルセーフで受信トレイ維持）: {str(exc)[:140]}",
+                            dry_run,
+                        )
+                    results[orig_idx] = rec
+                    history_buffer.append(rec)
+                    continue
+
+                parsed_list = [p for _, p in chunk]
+                max_out = min(4096, max(768, 240 * len(chunk)))
+                batch_timeout = max(timeout_s, 30 + len(chunk) * 3)
+                try:
+                    batch_resp = call_gemini_with_retry(
+                        key,
+                        model,
+                        build_batch_analysis_prompt(parsed_list),
+                        batch_timeout,
+                        schema=BATCH_RESPONSE_SCHEMA,
+                        max_output_tokens=max_out,
+                        max_retries=max_retries,
+                        caller_fn=caller_fn,
+                        sleep_fn=sleep_fn,
+                    )
+                    by_local_idx: dict[int, dict[str, Any]] = {}
+                    for item in batch_resp.get("results", []):
+                        if isinstance(item, dict) and "index" in item:
+                            try:
+                                by_local_idx[int(item["index"])] = item
+                            except (TypeError, ValueError):
+                                pass
+
+                    for local_i, (orig_idx, parsed) in enumerate(chunk):
+                        llm_item = by_local_idx.get(local_i)
+                        if llm_item is None:
+                            rec = _build_error_record(
+                                parsed,
+                                "バッチ応答欠落",
+                                "バッチ判定の応答に該当メールが含まれなかったため受信トレイを維持しました",
+                                dry_run,
+                            )
+                        else:
+                            rec = _build_result_record(parsed, llm_item, cfg, model, dry_run)
+                            if use_cache:
+                                new_cache_entries.append((parsed["cache_key"], rec))
+                        results[orig_idx] = rec
+                        history_buffer.append(rec)
+                except Exception as exc:
+                    err_msg = f"判定エラー（フェイルセーフで受信トレイ維持）: {str(exc)[:140]}"
+                    for orig_idx, parsed in chunk:
+                        rec = _build_error_record(parsed, "API呼び出しエラー", err_msg, dry_run)
+                        results[orig_idx] = rec
+                        history_buffer.append(rec)
+
+    # フェーズ3: 新規キャッシュのみ短時間セッションで一括保存
+    if new_cache_entries:
+        with open_db_session(cache_db_path) as conn:
+            for ckey, rec in new_cache_entries:
+                put_cached_result(conn, ckey, rec)
 
     if write_log and history_buffer:
         append_history_batch(history_buffer)

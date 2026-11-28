@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.1] - 2026-11-28
+
+### Fixed
+- **SQLite 並列ロック競合 (`database is locked`) を解消**: `PRAGMA journal_mode=WAL` / `busy_timeout=15000` を有効化し、Gemini API 通信中は DB トランザクションを一切保持しない3フェーズ構造へ変更。
+- **POP アカウント受信直後の `-1719` 参照失効（`Incoming POP Messages`）を自動救済**: Mail.app ルール側で `-1719`/`-1728` を検知した際に差分スキャンを非同期実行して確実に回収するよう改善。
+
+### Added
+- **5分おきのバックグラウンド自動差分スキャン (`./setup.sh enable-auto` / `disable-auto`)**: macOS `launchd` で Mail.app 起動中のみ（`--if-mail-running`）排他ロック付き（`fcntl.flock`）で自動実行。
+- **稼働実績の可視化**: 迷惑メール移動時の macOS 通知表示（`notify_on_junk`）および日別集計・振り分け一覧を表示する `./setup.sh stats` コマンドを追加。
+- 並行実行（SQLite ロック非競合）および排他ロックのユニットテストを追加（計20件）。
+
 ## [1.0.0] - 2026-11-27
 
 Mac標準「メール」アプリ（Mail.app）向け AIフィッシング自動振り分けツールの初回リリースです。

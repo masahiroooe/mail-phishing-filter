@@ -69,12 +69,16 @@ python3 scan_inbox.py --apply
 ## よく使うコマンド
 
 - 状態確認: `./setup.sh status`
+- 日別の稼働実績・迷惑メール振り分け一覧: `./setup.sh stats 7`
 - 判定ログの確認: `./setup.sh logs 20`
+- バックグラウンド定期差分スキャン有効化（5分おき・Mail.app起動中のみ）: `./setup.sh enable-auto 300`
+- バックグラウンド定期差分スキャン無効化: `./setup.sh disable-auto`
 - 信頼済みドメイン追加: `./setup.sh allow example.co.jp`
 - 設定ファイル: `~/.config/mail-phishing-filter/config.json`
   - `model`: デフォルト `gemini-3.5-flash-lite`（さらに精度重視なら `gemini-4-hydrogen` に変更可能）
   - `junk_confidence_threshold`: 迷惑メール移動のしきい値（デフォルト `0.85`）
   - `action_on_suspicious`: グレー判定時の動作（`"highlight"` / `"junk"` / `"none"`）
+  - `notify_on_junk`: 迷惑メール移動時に macOS 通知を表示（デフォルト `true`）
   - `batch_size`: 1リクエストにまとめる最大通数（デフォルト `10`）
   - `flood_window_seconds` / `flood_threshold`: 同一送信元の大量送信しきい値（デフォルト `600` 秒 / `8` 通）
   - `content_flood_window_seconds` / `content_flood_threshold`: 異アドレス同一内容のしきい値（デフォルト `3600` 秒 / `3` 通）

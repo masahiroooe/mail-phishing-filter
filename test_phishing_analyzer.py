@@ -668,6 +668,54 @@ class TestPhishingAnalyzer(unittest.TestCase):
         parsed = pa.parse_raw_email(raw, dict(pa.DEFAULT_CONFIG))
         self.assertLessEqual(len(parsed["body_text"]), pa.DEFAULT_CONFIG["max_body_chars"] + 40)
 
+    def test_concurrent_batch_execution_no_sqlite_lock_error(self) -> None:
+        from concurrent.futures import ThreadPoolExecutor
+        import time as _time
+
+        def slow_gemini(api_key: str, model: str, prompt: str, timeout: int):
+            # ネットワーク通信遅延を模擬（この間 DB ロックを握っていないこと）
+            _time.sleep(0.05)
+            return {
+                "verdict": "legitimate",
+                "confidence": 0.99,
+                "impersonated_brand": "",
+                "signals": ["ok"],
+                "reason": "正規",
+            }
+
+        with tempfile.TemporaryDirectory() as td:
+            db_path = Path(td) / "cache.sqlite3"
+            cfg = dict(pa.DEFAULT_CONFIG)
+
+            def worker(idx: int):
+                eml = SAMPLE_LEGIT_EML.replace(b"legit-test-001", f"concurrent-{idx}".encode())
+                return pa.analyze_email_bytes(
+                    eml,
+                    cfg,
+                    api_key="dummy-key",
+                    use_cache=True,
+                    write_log=False,
+                    cache_db_path=db_path,
+                    caller_fn=slow_gemini,
+                )
+
+            with ThreadPoolExecutor(max_workers=6) as ex:
+                results = list(ex.map(worker, range(6)))
+
+            self.assertEqual(len(results), 6)
+            self.assertTrue(all(r["action"] == "OK" for r in results))
+
+    def test_scan_lock_prevents_overlap(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            lock_path = Path(td) / "scan.lock"
+            with si.acquire_scan_lock(lock_path) as first:
+                self.assertTrue(first)
+                with si.acquire_scan_lock(lock_path) as second:
+                    self.assertFalse(second)
+            # ロック解放後は再取得できること
+            with si.acquire_scan_lock(lock_path) as third:
+                self.assertTrue(third)
+
 
 if __name__ == "__main__":
     unittest.main()

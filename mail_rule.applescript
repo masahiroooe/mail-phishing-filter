@@ -1,4 +1,4 @@
--- Mac標準「メール」アプリ（Mail.app）用 AIフィッシング自動振り分けスクリプト（バッチ判定対応）
+-- Mac標準「メール」アプリ（Mail.app）用 AIフィッシング自動振り分けスクリプト（バッチ判定・POP救済・通知対応）
 -- 配置先: ~/Library/Application Scripts/com.apple.mail/PhishingFilter.scpt
 --
 -- メール.app の「設定 > ルール」で以下のように登録して使用します:
@@ -7,6 +7,7 @@
 
 -- ※ `./setup.sh install` 実行時に __PROJECT_DIR__ が現在の配置パスへ自動展開されます
 property analyzerScriptPath : "__PROJECT_DIR__/phishing_analyzer.py"
+property scanInboxScriptPath : "__PROJECT_DIR__/scan_inbox.py"
 property pythonBinaryPath : "__PROJECT_DIR__/.venv/bin/python3"
 property fallbackPythonPath : "/usr/bin/python3"
 
@@ -33,6 +34,7 @@ on processMessages(msgList)
 	set pyBin to my resolvePythonBinary()
 	set targetMsgs to {}
 	set tmpPaths to {}
+	set hadPopRace to false
 
 	-- 1) 対象メールの生ソースをユーザー専用プライベート一時ディレクトリへ書き出し（同時受信の複数通を1リクエストにまとめる）
 	set tmpBase to POSIX path of (path to temporary items from user domain)
@@ -60,57 +62,89 @@ on processMessages(msgList)
 				set end of tmpPaths to tmpPath
 			end if
 		on error errMsg number errNum
-			my logError("Dump error (" & errNum & "): " & errMsg)
+			if errNum is -1719 or errNum is -1728 or (errMsg contains "Incoming POP Messages") then
+				-- POP受信直後の参照失効（Apple Mail既知挙動）→ 後段で差分スキャンを非同期キックして救済
+				set hadPopRace to true
+			else
+				my logError("Dump error (" & errNum & "): " & errMsg)
+			end if
 		end try
 	end repeat
 
-	if (count of targetMsgs) is 0 then return
+	-- 2) 取得できたメールを --batch で一括判定＆振り分け
+	set movedJunkCount to 0
+	set firstJunkReason to ""
 
-	-- 2) Python判定エンジンを --batch で一括呼び出し
-	try
+	if (count of targetMsgs) > 0 then
 		set argsStr to ""
 		repeat with p in tmpPaths
 			set argsStr to argsStr & " " & quoted form of (p as text)
 		end repeat
-		set cmd to quoted form of pyBin & " " & quoted form of analyzerScriptPath & " --batch" & argsStr
-		set outputText to do shell script cmd
-		set resultLines to paragraphs of outputText
 
-		-- 3) 入力順に対応する各行の判定結果を Mail.app へ適用
-		set lineCount to count of resultLines
-		set msgCount to count of targetMsgs
-		repeat with i from 1 to msgCount
-			if i <= lineCount then
-				try
-					set parts to my splitByPipe(item i of resultLines)
-					if (count of parts) >= 1 then
-						set actionCode to item 1 of parts
-						set theMsg to item i of targetMsgs
-						tell application "Mail"
-							if actionCode is "JUNK" then
-								set junk mail status of theMsg to true
-								set targetJunk to my findJunkMailboxForMessage(theMsg)
-								if targetJunk is not missing value then
-									move theMsg to targetJunk
+		try
+			set cmd to quoted form of pyBin & " " & quoted form of analyzerScriptPath & " --batch" & argsStr
+			set outputText to do shell script cmd
+			set resultLines to paragraphs of outputText
+
+			set lineCount to count of resultLines
+			set msgCount to count of targetMsgs
+			repeat with i from 1 to msgCount
+				if i <= lineCount then
+					try
+						set parts to my splitByPipe(item i of resultLines)
+						if (count of parts) >= 1 then
+							set actionCode to item 1 of parts
+							set theMsg to item i of targetMsgs
+							tell application "Mail"
+								if actionCode is "JUNK" then
+									set junk mail status of theMsg to true
+									set targetJunk to my findJunkMailboxForMessage(theMsg)
+									if targetJunk is not missing value then
+										move theMsg to targetJunk
+									end if
+									set movedJunkCount to movedJunkCount + 1
+									if firstJunkReason is "" and (count of parts) >= 5 then
+										set firstJunkReason to item 5 of parts
+									end if
+								else if actionCode is "SUSPICIOUS" then
+									set background color of theMsg to orange
 								end if
-							else if actionCode is "SUSPICIOUS" then
-								set background color of theMsg to orange
-							end if
-						end tell
-					end if
-				on error errMsg number errNum
-					my logError("Route error (" & errNum & "): " & errMsg)
-				end try
-			end if
-		end repeat
-	on error errMsg number errNum
-		my logError("Batch evaluate error (" & errNum & "): " & errMsg)
-	end try
+							end tell
+						end if
+					on error errMsg number errNum
+						my logError("Route error (" & errNum & "): " & errMsg)
+					end try
+				end if
+			end repeat
+		on error errMsg number errNum
+			my logError("Batch evaluate error (" & errNum & "): " & errMsg)
+		end try
 
-	-- 4) 一時ファイルを1回のコマンドで一括削除
-	try
-		do shell script "/bin/rm -f" & argsStr
-	end try
+		-- 3) 一時ファイルを1回のコマンドで一括削除
+		try
+			do shell script "/bin/rm -f" & argsStr
+		end try
+	end if
+
+	if movedJunkCount > 0 then
+		try
+			set noteText to (movedJunkCount as text) & "通を迷惑メールへ移動しました"
+			if firstJunkReason is not "" then
+				set noteText to noteText & "（" & firstJunkReason & "）"
+			end if
+			display notification noteText with title "AIフィッシング自動振り分け"
+		end try
+	end if
+
+	-- 4) POP参照失効が発生した場合、数秒後に差分スキャンを非同期実行して確実に救済する
+	if hadPopRace then
+		try
+			set rescueCmd to "(sleep 3; " & quoted form of pyBin & " " & quoted form of scanInboxScriptPath & " --apply --if-mail-running --limit 15) >/dev/null 2>&1 &"
+			do shell script rescueCmd
+		on error errMsg number errNum
+			my logError("POP rescue error (" & errNum & "): " & errMsg)
+		end try
+	end if
 end processMessages
 
 on findJunkMailboxForMessage(theMsg)

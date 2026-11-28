@@ -437,3 +437,37 @@ def apply_actions_batched(
             if len(parts) >= 2:
                 status_map[(acc_name, parts[0])] = parts[1]
     return status_map
+
+
+def is_mail_app_running() -> bool:
+    """Mail.app が現在起動しているかを軽量確認する（未起動時に勝手に立ち上げないため）。"""
+    try:
+        proc = subprocess.run(
+            ["/usr/bin/pgrep", "-x", "Mail"],
+            capture_output=True,
+            timeout=5,
+            check=False,
+        )
+        return proc.returncode == 0
+    except Exception:
+        return False
+
+
+_NOTIFY_SCRIPT = r'''
+on run argv
+	display notification (item 1 of argv) with title (item 2 of argv)
+end run
+'''
+
+
+def send_macos_notification(title: str, message: str) -> None:
+    """引数配列経由で安全に macOS 通知センターへ通知を送る。"""
+    try:
+        subprocess.run(
+            ["/usr/bin/osascript", "-e", _NOTIFY_SCRIPT, message[:160], title[:60]],
+            capture_output=True,
+            timeout=10,
+            check=False,
+        )
+    except Exception:
+        pass
