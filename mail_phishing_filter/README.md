@@ -70,11 +70,11 @@ flowchart TD
   - `sender_events (from_addr, cache_key PK, event_ts)`: 同一送信元バースト検知用（同一メール重複防止）
   - `content_events (content_hash, cache_key PK, from_addr, event_ts)`: 異アドレス含む同一内容バースト検知用
 - **主な公開シンボル**:
-  - `open_db_session(db_path)`: バッチ全体で1接続を使い回し、終了時に30日超の古いレコードを一括削除してコミットするコンテキストマネージャ
+  - `open_db_session(db_path)`: WAL モード（`PRAGMA journal_mode=WAL` / `busy_timeout=15000`）で1接続を使い回し、終了時に30日超の古いレコードを一括削除してコミットするコンテキストマネージャ
   - `record_sender_events` / `count_sender_burst`: スライディングウィンドウで指定メールを含む任意区間（`window_seconds`）の最大通数を算出
   - `record_content_events` / `count_content_burst`: 同様に `(最大通数, ユニーク送信元数)` を算出
   - `get_cached_result` / `put_cached_result` / `append_history_batch`
-- **変更時の注意点**: SQLite 接続は必ず `open_db_session()` 経由で1バッチ1接続に保ち、メール件数比例の接続開閉を作らないこと。
+- **変更時の注意点**: SQLite 接続は必ず `open_db_session()` 経由で短時間トランザクションに保ち、外部 API 通信などのネットワーク待ちの間はロックを保持しないこと。
 
 ### 5. `gemini_client.py`（307行）— Gemini Interactions API 通信
 - **責務**: システムプロンプト・Structured Output JSON スキーマの定義、Interactions API (`v1`, `store=False`) の呼び出し、一時エラーのリトライ制御。
@@ -106,6 +106,7 @@ flowchart TD
   - AppleScript 定数: `LIST_ACCOUNTS_SCRIPT`, `DUMP_ACCOUNT_INBOX_SCRIPT`, `DUMP_SELECTED_SCRIPT`, `APPLY_ACCOUNT_ACTIONS_SCRIPT`
   - `list_accounts()` / `dump_account_inbox(...)` / `dump_selected_messages(...)`
   - `apply_actions_batched(actions_by_account, search_window)`: アカウントあたり1回の `osascript` 起動で1パス走査→オブジェクト参照収集→一括移動/ハイライトを実行
+  - `is_mail_app_running()` / `send_macos_notification(title, message)`: Mail.app 起動確認（`pgrep -x Mail`）および引数配列経由の安全な macOS 通知表示
   - `load_scan_state` / `save_scan_state` / `update_account_watermark`
 - **変更時の注意点**: AppleScript を編集した場合は必ず `/usr/bin/osacompile` で Mail.app 辞書付きの構文検証を行うこと（`message id X` のような Mail.app 非対応構文を避ける）。
 
